@@ -30,11 +30,15 @@ TRANSFER=evals/v4/transfer-v4
 LOGS=runs/h200-logs
 BASELINES=${BASELINES:-"jaredpalmer/kev-0.8b jaredpalmer/kev-4b"}
 export TOKENIZERS_PARALLELISM=false
-# Kubernetes pods default to `options ndots:5` plus several search domains, so every PyPI / Hub / GitHub hostname costs
-# ~14 DNS queries; uv's parallel downloads then overload the cluster resolver and lookups fail ("Name has no usable
-# address"). glibc reads RES_OPTIONS from the environment: ndots:1 resolves those names directly (no root needed).
+# Kubernetes pods default to `options ndots:5` plus several search domains, so every PyPI / Hub / GitHub hostname is first
+# tried under each search domain. glibc programs (pip, Python, the Hub client) read RES_OPTIONS from the environment:
+# ndots:1 resolves those names directly (no root needed). uv's static musl resolver ignores it; see install().
 export RES_OPTIONS=${RES_OPTIONS:-"ndots:1 timeout:2 attempts:3"}
 export UV_CONCURRENT_DOWNLOADS=${UV_CONCURRENT_DOWNLOADS:-8} UV_HTTP_RETRIES=${UV_HTTP_RETRIES:-8} UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120}
+# set by install() when the environment came from pip (uv could not download): every later `uv run`, in this or a later
+# PHASE, then uses .venv as it is instead of trying to sync it
+PIP_MARKER=.venv/.kev-installed-with-pip
+if [ -f $PIP_MARKER ]; then export UV_NO_SYNC=1; fi
 
 # run.pid names our detached session only while that process is alive, leads its own session and is this script: a pod
 # reuses small PIDs soon after a run exits, and PHASE=stop kills the whole process group it names.
@@ -72,10 +76,26 @@ if [ "${FOREGROUND:-0}" != 1 ] && [ -z "${KEV_H200_DETACHED:-}" ]; then
 fi
 if [ -n "${KEV_H200_DETACHED:-}" ]; then trap 'rm -f $LOGS/run.pid' EXIT; fi   # a finished or failed run leaves no pid behind
 
+install() {
+  # flash-linear-attention + triton>=3.7.1: fast DeltaNet kernels for the Qwen3.5 control lane, installed over the lock
+  # exactly as modal_app.py's image does (torch 2.8 pins triton 3.4; the Modal image runs the newer one)
+  if uv sync --extra serve && uv pip install flash-linear-attention "triton>=3.7.1"; then rm -f $PIP_MARKER; return; fi
+  # The uv binary is static musl. musl ignores RES_OPTIONS and gives up on the first search domain that does not answer
+  # NXDOMAIN, so on a pod with ndots:5 it cannot resolve files.pythonhosted.org ("Name has no usable address") while
+  # glibc can. Install the exact uv.lock pins with pip instead (the venv's Python is glibc), then run uv without syncing.
+  echo "uv could not download; installing the uv.lock pins with pip" >&2
+  uv export --frozen --extra serve --no-emit-project --no-hashes -o $LOGS/requirements.txt   # offline: reads uv.lock
+  [ -x .venv/bin/python ] || uv venv
+  .venv/bin/python -m ensurepip --upgrade > /dev/null
+  .venv/bin/python -m pip install -q -r $LOGS/requirements.txt
+  .venv/bin/python -m pip install -q flash-linear-attention "triton>=3.7.1"   # pip notes torch's triton pin; expected, as above
+  .venv/bin/python -m pip install -q --no-deps -e .
+  touch $PIP_MARKER; export UV_NO_SYNC=1
+}
+
 setup() {
   nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-  uv sync --extra serve
-  uv pip install flash-linear-attention   # fast DeltaNet kernels for the Qwen3.5 control lane (as in the Modal image)
+  install
   uv run python -m pytest tests/test_unit.py -q
   for lane in $LANES; do   # validates every plan against the suite and fetches its partitions before any GPU time is spent
     uv run python -m kev.experiment --suite $SUITE --plan experiments/$lane.json --out runs/$lane --dry-run > /dev/null
