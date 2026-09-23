@@ -76,8 +76,9 @@ Title Case sections, API tables, Authors + License); model cards are formal.
 - Other base families: delimiters come from `kev.model.DELIMITER_SETS` via `delimiters(tok)` (first row that is five distinct added tokens;
   Qwen = `SPECIAL`, unchanged for every release). MiniCPM5 (`openbmb/MiniCPM5-2B-Base`, Llama architecture) uses its reserved
   `<unused_token_0/1>` for `<opt>`/`</opt>`: train with `--special_embeddings 1`. A base the suite did not pin gets the suite's admission
-  rule re-applied to its tokenizer in `kev.train` (3 of decision-v7's 12,576 for MiniCPM5). Local H200 runs: `scripts/h200_minicpm5.sh`
-  (three `kev.experiment` studies side by side via `--queue`, plans `experiments/{minicpm5-2b-a,minicpm5-2b-b,qwen35-2b-control}.json`).
+  rule re-applied to its tokenizer in `kev.train` (3 of decision-v7's 12,576 for MiniCPM5). Local GPU runs: `train_minicpm5.ipynb`
+  drives `scripts/h200_minicpm5.sh` (detached; each trial of `experiments/minicpm5-2b-{a,b}.json` is its own `kev.experiment` study on
+  its own `--queue`, scheduled over GPU slots sized by memory; `qwen35-2b-control.json` is the optional Qwen3.5-2B baseline).
 - Delta fine-tuning: `kev.train --init_from <run dir | Hub id[@rev]>` warm-starts LoRA + head (compatibility checked before load; source hashes in
   provenance; allowlisted in `kev/experiment.py` so studies can run cheap delta trials from a released checkpoint). Use lr <= 2e-5 for deltas.
 - Publish: `uv run python -m kev.publish --run runs/<run> --repo jaredpalmer/kev-<size> --card docs/model-cards/<name>.md` (needs `hf auth login`;

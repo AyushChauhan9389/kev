@@ -17,9 +17,8 @@
 #   minicpm5-2b-a       lr 1e-4 with and without --special_embeddings (are MiniCPM5's reserved delimiter rows usable untrained?)
 #   minicpm5-2b-b       lr 5e-5, and lr 1e-4 at a second seed
 #   qwen35-2b-control   Qwen3.5-2B-Base, the same recipe with no code changes (the base to beat)
-# Each lane is its own kev.experiment study on its own --queue. On a full H200 (>= 120 GB) the three run side by side,
-# otherwise one at a time; PARALLEL=n overrides. Rerunning PHASE=train skips finished lanes and restarts incomplete ones
-# (the partial study is kept as runs/<lane>.incomplete-<time>).
+# Every trial runs as its own job on a GPU slot (see gpu_slots and train): all visible GPUs by default (GPUS=0,1 picks),
+# 1-3 runs per GPU by memory (SLOTS=n overrides). 4 trials on 4 GPUs run at once; on a 32 GB MIG slice, one at a time.
 # The locked test partition is never read here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -112,42 +111,75 @@ setup() {
 trials_done() { local f=(runs/$1/*/result.json); if [ -e "${f[0]}" ]; then echo ${#f[@]}; else echo 0; fi; }
 trials_planned() { uv run python -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" experiments/$1.json; }
 
-# Lanes that fit side by side. Three 2B trainings need well over 71 GB; on a smaller slice (a MIG instance) a second lane
-# runs the first out of memory, which this container reports as an NVML INTERNAL ASSERT rather than "CUDA out of memory"
-# because it may not query NVML. auto = 3 on a GPU with >= 120 GB (measured through CUDA, which works where nvidia-smi
-# reports [Insufficient Permissions]), else 1.
-parallel_lanes() {
-  if [ "${PARALLEL:-auto}" != auto ]; then echo "$PARALLEL"; return; fi
-  uv run python -c "import torch; print(3 if torch.cuda.mem_get_info()[1] >= 120e9 else 1)"
+# GPU slots, one line each: "<CUDA_VISIBLE_DEVICES value> <slots> <description>". GPUS picks devices (default all visible),
+# SLOTS the runs per device (default by memory: 1 below 80 GB, e.g. a 32 GB MIG slice; 2 below 120 GB, e.g. H100 or
+# RTX Pro 6000; else 3, e.g. H200 or B200). Memory comes from CUDA, which works where nvidia-smi reports
+# [Insufficient Permissions]; a slice too small for two runs fails with an NVML INTERNAL ASSERT instead of an OOM message.
+gpu_slots() {
+  uv run python - "${GPUS:-all}" "${SLOTS:-auto}" <<'EOF'
+import os, sys, torch
+visible = os.environ.get("CUDA_VISIBLE_DEVICES")   # keep a pre-set list (MIG UUIDs): the index selects within it
+ids = range(torch.cuda.device_count()) if sys.argv[1] == "all" else [int(g) for g in sys.argv[1].split(",")]
+for i in ids:
+    gb = torch.cuda.get_device_properties(i).total_memory / 1e9
+    n = int(sys.argv[2]) if sys.argv[2] != "auto" else 1 if gb < 80 else 2 if gb < 120 else 3
+    print(visible.split(",")[i] if visible else i, n, f"{torch.cuda.get_device_name(i)}, {gb:.0f} GB")
+EOF
 }
 
+# One job = one trial of a lane's plan, run as its own kev.experiment study in runs/<lane>-t<k>, so trials spread over
+# GPUs. A lane that already finished as one study (runs/<lane>, the older layout) counts as done. Rerunning skips
+# finished jobs and restarts incomplete ones (the partial study is kept as runs/<job>.incomplete-<time>).
 train() {
-  mkdir -p $LOGS
-  local todo=() lane
+  mkdir -p $LOGS runs/h200-plans
+  local jobs=() lane k
   for lane in $LANES; do
-    local finished planned; finished=$(trials_done $lane); planned=$(trials_planned $lane)
-    if [ "$finished" -ge "$planned" ]; then echo "lane $lane: all $planned trials finished, skipping"; continue; fi
-    if [ -e runs/$lane ]; then   # an interrupted or failed study cannot be continued in place; keep it for its logs
-      local keep; keep=runs/$lane.incomplete-$(date +%Y%m%d-%H%M%S)
-      mv runs/$lane $keep; echo "lane $lane: $finished of $planned trials had finished; moved to $keep, rerunning the lane"
-    fi
-    todo+=($lane)
+    local planned; planned=$(trials_planned $lane)
+    if [ "$(trials_done $lane)" -ge "$planned" ]; then echo "lane $lane: finished as one study, skipping"; continue; fi
+    for ((k = 0; k < planned; k++)); do
+      local job=$lane-t$k
+      if [ "$(trials_done $job)" -ge 1 ]; then echo "$job: finished, skipping"; continue; fi
+      if [ -e runs/$job ]; then
+        local keep; keep=runs/$job.incomplete-$(date +%Y%m%d-%H%M%S); mv runs/$job $keep; echo "$job: incomplete, moved to $keep"
+      fi
+      uv run python -c "import json, sys; json.dump([json.load(open(sys.argv[1]))[int(sys.argv[2])]], open(sys.argv[3], 'w'))" \
+        experiments/$lane.json $k runs/h200-plans/$job.json
+      jobs+=($job)
+    done
   done
-  local slots; slots=$(parallel_lanes)
-  echo "GPU memory: $(uv run python -c "import torch; f, t = torch.cuda.mem_get_info(); print(f'{t / 1e9:.0f} GB total, {f / 1e9:.0f} GB free')"); running $slots lane(s) at a time"
-  local failed=0 i=0
-  while [ $i -lt ${#todo[@]} ]; do
-    local pids=() names=()
-    for lane in "${todo[@]:$i:$slots}"; do
-      uv run python -m kev.experiment --suite $SUITE --plan experiments/$lane.json --transfer $TRANSFER \
-        --out runs/$lane --queue $lane --device cuda > $LOGS/$lane.log 2>&1 &
-      pids+=($!); names+=($lane); echo "lane $lane: pid $! (log $LOGS/$lane.log)"
-      if [ $slots -gt 1 ]; then sleep 60; fi   # stagger model loading
+  if [ ${#jobs[@]} -eq 0 ]; then echo "nothing to train"; return 0; fi
+
+  # slot list, first slots of every GPU before second ones: 4 jobs on 4 GPUs get one GPU each
+  local lines=() slots=() line s dev n rest
+  mapfile -t lines < <(gpu_slots)
+  for line in "${lines[@]}"; do read -r dev n rest <<< "$line"; echo "GPU $dev: $rest -> $n run(s) at a time"; done
+  for ((s = 0; s < 3; s++)); do
+    for line in "${lines[@]}"; do
+      read -r dev n rest <<< "$line"; if [ $s -lt $n ]; then slots+=("$dev"); fi
     done
-    for j in "${!pids[@]}"; do
-      if wait "${pids[$j]}"; then echo "lane ${names[$j]} finished"; else echo "lane ${names[$j]} failed; see $LOGS/${names[$j]}.log" >&2; failed=1; fi
+  done
+  echo "${#jobs[@]} runs over ${#slots[@]} slot(s): ${jobs[*]}"
+
+  local -A pid_of job_of
+  local failed=0 next=0 i pid job
+  while :; do
+    for i in "${!slots[@]}"; do
+      pid=${pid_of[$i]:-}
+      if [ -n "$pid" ] && ! kill -0 $pid 2>/dev/null; then   # bash reaps finished jobs and keeps their status for wait
+        if wait $pid; then echo "$(date +%T) ${job_of[$i]} finished"; else echo "$(date +%T) ${job_of[$i]} failed; see $LOGS/${job_of[$i]}.log" >&2; failed=1; fi
+        unset "pid_of[$i]"; pid=
+      fi
+      if [ -z "$pid" ] && [ $next -lt ${#jobs[@]} ]; then
+        job=${jobs[$next]}; next=$((next + 1))
+        CUDA_VISIBLE_DEVICES=${slots[$i]} uv run python -m kev.experiment --suite $SUITE --plan runs/h200-plans/$job.json \
+          --transfer $TRANSFER --out runs/$job --queue $job --device cuda > $LOGS/$job.log 2>&1 &
+        pid_of[$i]=$!; job_of[$i]=$job
+        echo "$(date +%T) $job -> GPU ${slots[$i]} (log $LOGS/$job.log)"
+        sleep ${STAGGER:-20}   # stagger model loading
+      fi
     done
-    i=$((i + slots))
+    if [ $next -ge ${#jobs[@]} ] && [ ${#pid_of[@]} -eq 0 ]; then break; fi
+    sleep ${POLL:-30}
   done
   return $failed
 }
@@ -155,12 +187,14 @@ train() {
 evaluate() {
   # the winner: best transfer-v4 development accuracy over every finished trial (model selection on development data only)
   local winner
+  export CUDA_VISIBLE_DEVICES; CUDA_VISIBLE_DEVICES=$(gpu_slots | head -1 | cut -d' ' -f1)   # evaluate on the first selected GPU
   winner=$(uv run python - $LANES <<'EOF'
 import json, sys
 from pathlib import Path
 rows = []
 for lane in sys.argv[1:]:
-    for result in sorted(Path("runs", lane).glob("*/result.json")):
+    studies = [Path("runs", lane)] + [p for p in Path("runs").glob(f"{lane}-t*") if ".incomplete" not in p.name]
+    for result in sorted(r for study in studies for r in study.glob("*/result.json")):
         r = json.loads(result.read_text(encoding="utf-8"))
         cfg = r["provenance"]["config"]
         rows.append((r["transfer"]["clean"]["acc"], r["clean"]["acc"], r["transfer"]["clean"]["brier"], cfg["base"].split("/")[1], cfg["lr"], cfg.get("special_embeddings", 0), cfg["seed"], str(result.parent)))
@@ -180,7 +214,7 @@ EOF
     for base in $BASELINES; do
       local tag=${base#*/}
       [ -e runs/h200-eval/$tag-$name ] || uv run python -m kev.benchmark --run $base --suite $suite --device cuda --out runs/h200-eval/$tag-$name
-      uv run python -m kev.compare --candidate runs/h200-eval/winner-$name --reference runs/h200-eval/$tag-$name --out runs/h200-eval/winner-vs-$tag-$name
+      uv run python -m kev.compare --candidate runs/h200-eval/winner-$name --reference runs/h200-eval/$tag-$name --out runs/h200-eval/winner-vs-$tag-$name.json
     done
   done
   echo "done: reports in runs/h200-eval/ (report.json per run, compare output per pair); winner checkpoint $winner/checkpoint"
