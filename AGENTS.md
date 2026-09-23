@@ -73,6 +73,11 @@ Title Case sections, API tables, Authors + License); model cards are formal.
   routes them through `forward_rows_batch` (one causal row per question, state repeated) and `_branch_rows_from_prefix` for serving; the packed
   block-causal mask is only valid on attention-only bases. Needs transformers>=5.17, peft>=0.21; CUDA wants `flash-linear-attention` + `triton>=3.7.1`
   (in the Modal image). MPS has no fast DeltaNet kernels, so on Apple Silicon `kev.serve` runs these checkpoints through `kev/mlx_model.py` (mlx-lm's Metal kernels; M5, 5 questions on a ~270-token state: Kev-4B 721 ms new state / 136 ms cached state vs 3302 / 847 ms for torch bf16; parity with fp32 torch on the full decision-v7 development partition: 4B max |dp| 0.025, 1 flip in 1,264 questions; 0.8B max 0.054, 4 flips (`runs/r4-mlx-parity-*`)). Plan and results: PLAN.md, History > "Qwen3.5 port".
+- Other base families: delimiters come from `kev.model.DELIMITER_SETS` via `delimiters(tok)` (first row that is five distinct added tokens;
+  Qwen = `SPECIAL`, unchanged for every release). MiniCPM5 (`openbmb/MiniCPM5-2B-Base`, Llama architecture) uses its reserved
+  `<unused_token_0/1>` for `<opt>`/`</opt>`: train with `--special_embeddings 1`. A base the suite did not pin gets the suite's admission
+  rule re-applied to its tokenizer in `kev.train` (3 of decision-v7's 12,576 for MiniCPM5). Local H200 runs: `scripts/h200_minicpm5.sh`
+  (three `kev.experiment` studies side by side via `--queue`, plans `experiments/{minicpm5-2b-a,minicpm5-2b-b,qwen35-2b-control}.json`).
 - Delta fine-tuning: `kev.train --init_from <run dir | Hub id[@rev]>` warm-starts LoRA + head (compatibility checked before load; source hashes in
   provenance; allowlisted in `kev/experiment.py` so studies can run cheap delta trials from a released checkpoint). Use lr <= 2e-5 for deltas.
 - Publish: `uv run python -m kev.publish --run runs/<run> --repo jaredpalmer/kev-<size> --card docs/model-cards/<name>.md` (needs `hf auth login`;

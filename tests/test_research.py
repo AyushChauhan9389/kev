@@ -91,12 +91,20 @@ def test_strict_encoding_rejects_truncation():
     from types import SimpleNamespace
     from kev.model import encode
 
+    from kev.model import SPECIAL
+
     class Tokenizer:
+        added = {t: 1000 + i for i, t in enumerate(SPECIAL)}
+        all_special_tokens = []
+
         def __call__(self, text, **kwargs):
             return SimpleNamespace(input_ids=list(range(len(text))))
 
+        def get_added_vocab(self):
+            return self.added
+
         def convert_tokens_to_ids(self, text):
-            return 1000
+            return self.added[text]
 
     rec = {"state": "abcdefgh", "questions": [{"instr": "q", "options": ["a", "b"], "label": 0}]}
     assert encode(Tokenizer(), rec, max_state=4)["state_truncated"]

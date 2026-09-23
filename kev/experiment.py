@@ -112,13 +112,16 @@ def git_commit():
 
 
 @contextmanager
-def study_lock():
+def study_lock(queue="research"):
+    """One study per GPU queue. The default queue serializes every study on this machine; a GPU with room for several
+    trials (an H200 and a 2B base) runs studies side by side under different --queue names."""
+    if not re.fullmatch(r"[a-z0-9_-]+", queue): raise ValueError("--queue must be lowercase letters, digits, - or _")
     (ROOT / "runs").mkdir(exist_ok=True)
-    with (ROOT / "runs/.research.lock").open("a") as lock:
+    with (ROOT / f"runs/.{queue}.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError("another research runner owns the GPU queue") from None
+            raise RuntimeError(f"another research runner owns the {queue!r} GPU queue") from None
         yield
 
 
@@ -343,6 +346,7 @@ def main():
     ap.add_argument("--wait-pid", type=int)
     ap.add_argument("--device", choices=["cpu", "mps", "cuda"], default=default_device())
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--queue", default="research", help="GPU queue (lock) name; studies on different queues run concurrently")
     ap.add_argument("--aggregate", action="store_true", help="rank an existing study directory (e.g. after Modal trials)")
     ap.add_argument("--transfer", help="eval-only suite whose development partition is scored for every trial (out-of-domain check)")
     ap.add_argument("--resume", action="store_true", help="finish evaluation for trials in --out that have a checkpoint but no result.json (interrupted studies)")
@@ -366,7 +370,7 @@ def main():
         print(json.dumps({"trials": trials, "existing": a.existing, "suite_sha256": digest(suite / "manifest.json"), "locked_test": "not read"}, indent=2))
         return
     expected_sources = source_hashes()
-    with study_lock():
+    with study_lock(a.queue):
         if a.wait_pid:
             print(f"Waiting for existing training process {a.wait_pid}; no competing GPU job will start.", flush=True)
             while True:

@@ -159,3 +159,35 @@ def test_init_from_warm_start_and_compatibility_checks(tmp_path):
     assert hb.extra["init_source"]["adapter_sha256"] and read_json(tmp_path / "b/training_config.json")["init_source"]["resolved"] == str(tmp_path / "a")
     bad = subprocess.run(base + ["--out", str(tmp_path / "c"), "--init_from", str(tmp_path / "a"), "--lora", "8"], capture_output=True, text=True, env=env)
     assert bad.returncode != 0 and "lora is 16 there and 8 here" in bad.stderr
+
+
+MINICPM_SMOKE = os.environ.get("KEV_MINICPM_SMOKE", "runs/h200-smoke")
+
+
+def test_minicpm_checkpoint_serving_paths():
+    """A MiniCPM5 checkpoint (LlamaForCausalLM, reserved delimiter rows trained through --special_embeddings) through the
+    serving paths: the packed mask equals one causal row per question, the prefix cache equals the full pass, and the
+    adapter carries the delimiter embeddings it was trained with (so it loads unmerged). scripts/h200_minicpm5.sh trains
+    the checkpoint before the long runs start; skipped without it."""
+    if not os.path.exists(f"{MINICPM_SMOKE}/head.pt"): pytest.skip("MiniCPM5 smoke checkpoint not present")
+    import torch
+    from kev.checkpoint import Checkpoint
+    from kev.data import materialize
+    from kev.device import default_device
+    from kev.model import SPECIAL, delimiter_ids, delimiters
+    from kev.suite import load_split
+    device = default_device()
+    checkpoint = Checkpoint(MINICPM_SMOKE)
+    tok, m = checkpoint.load(device)
+    assert delimiters(tok) != SPECIAL and not m.hybrid
+    assert sorted(checkpoint.adapter_config()["trainable_token_indices"]["embed_tokens"]) == sorted(delimiter_ids(tok))
+    tol = 1e-4 if device == "cpu" else 1e-3   # different sequence lengths take different GPU reduction orders
+    with torch.no_grad():
+        for r in [materialize(r) for r in load_split("evals/smoke-v1", "development")[:4]]:
+            enc = m.encode(tok, r)
+            packed = torch.cat(m.probs(enc))
+            rows = torch.cat([torch.softmax(z, -1).cpu() for z in m.forward_rows_batch([enc])[0]])
+            miss, prefix = m.probs_and_prefix(enc)
+            hit = torch.cat(m.probs_with_prefix(enc, prefix))
+            for got in (rows, torch.cat(miss), hit):
+                assert (got - packed).abs().max() < tol

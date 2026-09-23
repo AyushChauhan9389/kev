@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache
 from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
-from .suite import SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
-from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, training_context
+from .suite import ADMISSION_BRANCH_HEADROOM, SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
+from .model import MAX_STATE, MAX_TRAIN_STATE, SPECIAL, DecisionModel, delimiters, fits, load_tokenizer, training_context
 
 
 # --- losses -----------------------------------------------------------------------------------------------------------
@@ -93,6 +93,17 @@ def training_requests(a, tok, manifest, holdout):
             reqs = reqs + replay
     elif manifest:
         reqs = load_split(a.suite, "train"); validate_training(reqs, manifest)
+        if a.base not in manifest["base_revisions"]:
+            # the suite admitted its records against its pinned bases' tokenizers only; a different tokenizer (MiniCPM5) can
+            # push a record past the context once augmentation adds options, and the strict encoder would abort mid-run.
+            # Re-apply the suite's admission rule for this tokenizer (0 of decision-v7's 12,576 for Qwen3.5, 3 for MiniCPM5).
+            c = training_context(a.max_state)
+            limits = {**c, "max_branch": c["max_branch"] - ADMISSION_BRANCH_HEADROOM}
+            kept = [r for r in reqs if fits(materialize(r), tok, **limits)]
+            if len(kept) < len(reqs):
+                print(f"dropped {len(reqs) - len(kept)} of {len(reqs)} suite records that {a.base}'s tokenizer puts past the "
+                      f"suite's admission rule ({limits['max_branch']} branch tokens)", flush=True)
+            reqs = kept
     else:
         reqs = build(a.n_per_source, "train", a.seed, exclude=holdout)
     if not manifest or a.data:
@@ -289,6 +300,9 @@ def main():
     anchor_sources = set(a.anchor_sources.split(",")) if a.anchor_sources else None
 
     tok = load_tokenizer(a.base, revision=revision)
+    if delimiters(tok) != SPECIAL and not a.special_embeddings:
+        print(f"warning: {a.base} uses reserved delimiter tokens {delimiters(tok)} whose embeddings were never trained; "
+              "--special_embeddings 1 trains them", flush=True)
     model = DecisionModel(a.base, tok, dev, lora=a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
                           option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
                           dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32)

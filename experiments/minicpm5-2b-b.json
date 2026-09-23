@@ -1,0 +1,4 @@
+[
+  {"base": "openbmb/MiniCPM5-2B-Base", "base_revision": "96a57cd572a02506b4500f54427dca24970c1bac", "seed": 0, "epochs": 2, "batch": 8, "accum": 1, "dtype": "bf16", "checkpointing": 1, "p_none_pair": 0.25, "lr": 0.00005, "special_embeddings": 1},
+  {"base": "openbmb/MiniCPM5-2B-Base", "base_revision": "96a57cd572a02506b4500f54427dca24970c1bac", "seed": 1, "epochs": 2, "batch": 8, "accum": 1, "dtype": "bf16", "checkpointing": 1, "p_none_pair": 0.25, "lr": 0.0001, "special_embeddings": 1}
+]
