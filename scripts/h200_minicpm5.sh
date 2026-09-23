@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Kev on MiniCPM5-2B-Base, run on one local H200 (no Modal): three studies side by side, then pick and score the winner.
 #
-#   scripts/h200_minicpm5.sh            # setup + train + eval
+#   scripts/h200_minicpm5.sh               # setup + train + eval, detached: returns at once, survives closing the terminal / SSH
 #   PHASE=train scripts/h200_minicpm5.sh
 #   PHASE=eval  scripts/h200_minicpm5.sh   # after training finished (or to re-score)
+#   PHASE=status scripts/h200_minicpm5.sh  # is it running, last log lines, GPU memory
+#   PHASE=stop  scripts/h200_minicpm5.sh   # stop the run and every lane it started
+#   FOREGROUND=1 scripts/h200_minicpm5.sh  # stay attached (Ctrl-C stops it)
+#
+# Detached runs start in their own session (setsid, stdin closed), so no hangup reaches them; everything goes to
+# runs/h200-logs/run.log (lanes: runs/h200-logs/<lane>.log) and the session id to runs/h200-logs/run.pid.
 #
 # Lanes (experiments/*.json, 2 trials each, the decision-v7 recipe at batch 8 / bf16 / 2 epochs, each trial also scored
 # on transfer-v4 development):
@@ -24,6 +30,34 @@ TRANSFER=evals/v4/transfer-v4
 LOGS=runs/h200-logs
 BASELINES=${BASELINES:-"jaredpalmer/kev-0.8b jaredpalmer/kev-4b"}
 export TOKENIZERS_PARALLELISM=false
+
+running() { [ -f $LOGS/run.pid ] && kill -0 "$(cat $LOGS/run.pid)" 2>/dev/null; }
+
+case $PHASE in
+  status)
+    if running; then echo "running: session $(cat $LOGS/run.pid)"; else echo "not running"; fi
+    [ -f $LOGS/run.log ] && tail -n 15 $LOGS/run.log
+    for log in $LOGS/*.log; do [ "$log" = $LOGS/run.log ] || { [ -f "$log" ] && echo "== $log" && tail -n 3 "$log"; }; done
+    nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
+    exit 0 ;;
+  stop)
+    if running; then kill -- "-$(cat $LOGS/run.pid)" && echo "stopped session $(cat $LOGS/run.pid) and its lanes"; else echo "not running"; fi
+    exit 0 ;;
+esac
+
+if [ "${FOREGROUND:-0}" != 1 ] && [ -z "${KEV_H200_DETACHED:-}" ]; then
+  if running; then echo "already running (session $(cat $LOGS/run.pid)); PHASE=status or PHASE=stop" >&2; exit 1; fi
+  mkdir -p $LOGS
+  # a script's background job is not a process-group leader, so setsid execs in place: $! is the new session's leader
+  # and its id is the process group PHASE=stop kills (the lanes inherit it)
+  KEV_H200_DETACHED=1 setsid nohup "$0" "$@" > $LOGS/run.log 2>&1 < /dev/null &
+  echo $! > $LOGS/run.pid
+  echo "detached: session $!, PHASE=$PHASE"
+  echo "  follow:  tail -f $LOGS/run.log"
+  echo "  status:  PHASE=status $0"
+  echo "  stop:    PHASE=stop $0"
+  exit 0
+fi
 
 setup() {
   nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
@@ -93,9 +127,9 @@ EOF
 }
 
 case $PHASE in
-  all) setup; train; evaluate ;;
+  all) setup; train; evaluate; echo "all phases finished" ;;
   setup) setup ;;
   train) train ;;
   eval) evaluate ;;
-  *) echo "PHASE must be all, setup, train or eval" >&2; exit 2 ;;
+  *) echo "PHASE must be all, setup, train, eval, status or stop" >&2; exit 2 ;;
 esac
