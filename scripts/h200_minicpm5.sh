@@ -36,7 +36,14 @@ export TOKENIZERS_PARALLELISM=false
 export RES_OPTIONS=${RES_OPTIONS:-"ndots:1 timeout:2 attempts:3"}
 export UV_CONCURRENT_DOWNLOADS=${UV_CONCURRENT_DOWNLOADS:-8} UV_HTTP_RETRIES=${UV_HTTP_RETRIES:-8} UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120}
 
-running() { [ -f $LOGS/run.pid ] && kill -0 "$(cat $LOGS/run.pid)" 2>/dev/null; }
+# run.pid names our detached session only while that process is alive, leads its own session and is this script: a pod
+# reuses small PIDs soon after a run exits, and PHASE=stop kills the whole process group it names.
+running() {
+  [ -f $LOGS/run.pid ] || return 1
+  local pid; pid=$(cat $LOGS/run.pid)
+  [[ $pid =~ ^[0-9]+$ ]] && [ "$(ps -o sid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$pid" ] \
+    && ps -o args= -p "$pid" | grep -q "h200_minicpm5.sh"
+}
 
 case $PHASE in
   status)
@@ -46,7 +53,7 @@ case $PHASE in
     nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
     exit 0 ;;
   stop)
-    if running; then kill -- "-$(cat $LOGS/run.pid)" && echo "stopped session $(cat $LOGS/run.pid) and its lanes"; else echo "not running"; fi
+    if running; then pid=$(cat $LOGS/run.pid); kill -- "-$pid" && echo "stopped session $pid and its lanes"; else echo "not running"; fi
     exit 0 ;;
 esac
 
@@ -63,6 +70,7 @@ if [ "${FOREGROUND:-0}" != 1 ] && [ -z "${KEV_H200_DETACHED:-}" ]; then
   echo "  stop:    PHASE=stop $0"
   exit 0
 fi
+if [ -n "${KEV_H200_DETACHED:-}" ]; then trap 'rm -f $LOGS/run.pid' EXIT; fi   # a finished or failed run leaves no pid behind
 
 setup() {
   nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
