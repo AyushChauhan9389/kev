@@ -3,6 +3,7 @@
 #
 #   scripts/h200_minicpm5.sh               # setup + train + eval, detached: returns at once, survives closing the terminal / SSH
 #   PHASE=train scripts/h200_minicpm5.sh
+#   PHASE=resume scripts/h200_minicpm5.sh  # setup already done: train the unfinished lanes, then eval
 #   PHASE=eval  scripts/h200_minicpm5.sh   # after training finished (or to re-score)
 #   PHASE=status scripts/h200_minicpm5.sh  # is it running, last log lines, GPU memory
 #   PHASE=stop  scripts/h200_minicpm5.sh   # stop the run and every lane it started
@@ -16,9 +17,9 @@
 #   minicpm5-2b-a       lr 1e-4 with and without --special_embeddings (are MiniCPM5's reserved delimiter rows usable untrained?)
 #   minicpm5-2b-b       lr 5e-5, and lr 1e-4 at a second seed
 #   qwen35-2b-control   Qwen3.5-2B-Base, the same recipe with no code changes (the base to beat)
-# Each lane is its own kev.experiment study on its own --queue, so the three share the GPU. They train with gradient
-# checkpointing: three 2B trainings then stay far below 141 GB and together keep the H200 busy. Watch `nvidia-smi`; with
-# memory to spare, add lanes (a copy of a plan with other seeds) rather than turning checkpointing off.
+# Each lane is its own kev.experiment study on its own --queue. On a full H200 (>= 120 GB) the three run side by side,
+# otherwise one at a time; PARALLEL=n overrides. Rerunning PHASE=train skips finished lanes and restarts incomplete ones
+# (the partial study is kept as runs/<lane>.incomplete-<time>).
 # The locked test partition is never read here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -108,19 +109,45 @@ setup() {
   KEV_MINICPM_SMOKE=runs/h200-smoke uv run --extra serve python -m pytest tests/test_model.py -k minicpm -q -rs
 }
 
+trials_done() { local f=(runs/$1/*/result.json); if [ -e "${f[0]}" ]; then echo ${#f[@]}; else echo 0; fi; }
+trials_planned() { uv run python -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" experiments/$1.json; }
+
+# Lanes that fit side by side. Three 2B trainings need well over 71 GB; on a smaller slice (a MIG instance) a second lane
+# runs the first out of memory, which this container reports as an NVML INTERNAL ASSERT rather than "CUDA out of memory"
+# because it may not query NVML. auto = 3 on a GPU with >= 120 GB (measured through CUDA, which works where nvidia-smi
+# reports [Insufficient Permissions]), else 1.
+parallel_lanes() {
+  if [ "${PARALLEL:-auto}" != auto ]; then echo "$PARALLEL"; return; fi
+  uv run python -c "import torch; print(3 if torch.cuda.mem_get_info()[1] >= 120e9 else 1)"
+}
+
 train() {
   mkdir -p $LOGS
-  local pids=()
+  local todo=() lane
   for lane in $LANES; do
-    if [ -e runs/$lane ]; then echo "runs/$lane exists; move it away or drop the lane from LANES" >&2; exit 1; fi
-    uv run python -m kev.experiment --suite $SUITE --plan experiments/$lane.json --transfer $TRANSFER \
-      --out runs/$lane --queue $lane --device cuda > $LOGS/$lane.log 2>&1 &
-    pids+=($!); echo "lane $lane: pid $! (log $LOGS/$lane.log)"
-    sleep 60   # stagger model loading
+    local finished planned; finished=$(trials_done $lane); planned=$(trials_planned $lane)
+    if [ "$finished" -ge "$planned" ]; then echo "lane $lane: all $planned trials finished, skipping"; continue; fi
+    if [ -e runs/$lane ]; then   # an interrupted or failed study cannot be continued in place; keep it for its logs
+      local keep; keep=runs/$lane.incomplete-$(date +%Y%m%d-%H%M%S)
+      mv runs/$lane $keep; echo "lane $lane: $finished of $planned trials had finished; moved to $keep, rerunning the lane"
+    fi
+    todo+=($lane)
   done
-  local failed=0
-  for i in "${!pids[@]}"; do
-    wait "${pids[$i]}" || { echo "lane $(echo $LANES | cut -d' ' -f$((i + 1))) failed; see its log" >&2; failed=1; }
+  local slots; slots=$(parallel_lanes)
+  echo "GPU memory: $(uv run python -c "import torch; f, t = torch.cuda.mem_get_info(); print(f'{t / 1e9:.0f} GB total, {f / 1e9:.0f} GB free')"); running $slots lane(s) at a time"
+  local failed=0 i=0
+  while [ $i -lt ${#todo[@]} ]; do
+    local pids=() names=()
+    for lane in "${todo[@]:$i:$slots}"; do
+      uv run python -m kev.experiment --suite $SUITE --plan experiments/$lane.json --transfer $TRANSFER \
+        --out runs/$lane --queue $lane --device cuda > $LOGS/$lane.log 2>&1 &
+      pids+=($!); names+=($lane); echo "lane $lane: pid $! (log $LOGS/$lane.log)"
+      if [ $slots -gt 1 ]; then sleep 60; fi   # stagger model loading
+    done
+    for j in "${!pids[@]}"; do
+      if wait "${pids[$j]}"; then echo "lane ${names[$j]} finished"; else echo "lane ${names[$j]} failed; see $LOGS/${names[$j]}.log" >&2; failed=1; fi
+    done
+    i=$((i + slots))
   done
   return $failed
 }
@@ -163,6 +190,7 @@ case $PHASE in
   all) setup; train; evaluate; echo "all phases finished" ;;
   setup) setup ;;
   train) train ;;
+  resume) train; evaluate; echo "all phases finished" ;;   # after setup already ran: unfinished lanes, then the evaluation
   eval) evaluate ;;
-  *) echo "PHASE must be all, setup, train, eval, status or stop" >&2; exit 2 ;;
+  *) echo "PHASE must be all, setup, train, resume, eval, status or stop" >&2; exit 2 ;;
 esac
