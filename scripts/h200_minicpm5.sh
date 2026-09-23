@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PHASE=${PHASE:-all}
-LANES=${LANES:-"minicpm5-2b-a minicpm5-2b-b qwen35-2b-control"}
+LANES=${LANES:-"minicpm5-2b-a minicpm5-2b-b"}   # add qwen35-2b-control for the Qwen3.5-2B baseline
 SUITE=evals/v7/decision-v7
 TRANSFER=evals/v4/transfer-v4
 LOGS=runs/h200-logs
