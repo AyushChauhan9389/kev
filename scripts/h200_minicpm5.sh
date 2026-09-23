@@ -30,6 +30,11 @@ TRANSFER=evals/v4/transfer-v4
 LOGS=runs/h200-logs
 BASELINES=${BASELINES:-"jaredpalmer/kev-0.8b jaredpalmer/kev-4b"}
 export TOKENIZERS_PARALLELISM=false
+# Kubernetes pods default to `options ndots:5` plus several search domains, so every PyPI / Hub / GitHub hostname costs
+# ~14 DNS queries; uv's parallel downloads then overload the cluster resolver and lookups fail ("Name has no usable
+# address"). glibc reads RES_OPTIONS from the environment: ndots:1 resolves those names directly (no root needed).
+export RES_OPTIONS=${RES_OPTIONS:-"ndots:1 timeout:2 attempts:3"}
+export UV_CONCURRENT_DOWNLOADS=${UV_CONCURRENT_DOWNLOADS:-8} UV_HTTP_RETRIES=${UV_HTTP_RETRIES:-8} UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120}
 
 running() { [ -f $LOGS/run.pid ] && kill -0 "$(cat $LOGS/run.pid)" 2>/dev/null; }
 
