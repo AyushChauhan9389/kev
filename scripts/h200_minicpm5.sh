@@ -84,7 +84,7 @@ install() {
   # NXDOMAIN, so on a pod with ndots:5 it cannot resolve files.pythonhosted.org ("Name has no usable address") while
   # glibc can. Install the exact uv.lock pins with pip instead (the venv's Python is glibc), then run uv without syncing.
   echo "uv could not download; installing the uv.lock pins with pip" >&2
-  uv export --frozen --extra serve --no-emit-project --no-hashes -o $LOGS/requirements.txt   # offline: reads uv.lock
+  uv export --frozen --extra serve --no-emit-project --no-hashes -o $LOGS/requirements.txt > /dev/null   # offline: reads uv.lock
   [ -x .venv/bin/python ] || uv venv
   .venv/bin/python -m ensurepip --upgrade > /dev/null
   .venv/bin/python -m pip install -q -r $LOGS/requirements.txt
